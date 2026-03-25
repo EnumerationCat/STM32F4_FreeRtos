@@ -1,0 +1,290 @@
+
+#include "FreeRtos_demo.h"
+
+
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include <stdio.h>
+
+/**
+ * @brief  重定向标准输出到串口1（适用于GCC）
+ */
+int _write(int file, char *ptr, int len)
+{
+    if (file == STDOUT_FILENO || file == STDERR_FILENO)
+    {
+        HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+        return len;
+    }
+
+    errno = EBADF;
+    return -1;
+}
+
+
+
+/**
+ * @brief 栈溢出钩子函数（configCHECK_FOR_STACK_OVERFLOW>0 时必须实现）
+ * @param pxTask 发生栈溢出的任务句柄
+ * @param pcTaskName 发生栈溢出的任务名
+ */
+void vApplicationStackOverflowHook( TaskHandle_t pxTask, char *pcTaskName )
+{
+    /* 栈溢出处理逻辑，比如打印任务名、触发硬件看门狗、记录日志等 */
+    ( void ) pxTask;
+    ( void ) pcTaskName;
+    /* 死循环（可选，便于调试定位问题） */
+    for( ;; )
+	{
+		usbprintf("StackOverflow!");
+		vTaskDelay(1000); // 延时1秒，避免打印过快导致串口堵塞
+	}
+}
+
+
+
+
+uint8_t  myUsbRxData[64] = { 0 };   // 接收到的数据
+uint16_t myUsbRxNum = 0;            // 接收到的字节数
+
+void usbRecData(void) {
+    // 判断接收
+    if (myUsbRxNum)
+    {
+        static char myStr[200] = { 0 };
+        sprintf(myStr, "\r\n收到 %d 个字节\r\n内容是: %s\r\n", myUsbRxNum, (char *)myUsbRxData);
+        CDC_Transmit_FS((uint8_t *)myStr, strlen(myStr));
+        myUsbRxNum = 0;
+    }
+}
+
+// 定义缓冲区大小（可根据需求调整，建议256/512字节）
+#define USB_PRINTF_BUF_SIZE 256
+
+/**
+ * @brief  自定义USB printf函数，支持格式化输出到USB CDC串口
+ * @param  format: 格式化字符串（同printf）
+ * @param  ...: 可变参数列表
+ * @retval 发送的字节数（成功）/ -1（缓冲区溢出）/ -2（发送失败）
+ */
+int usbprintf(const char *format, ...)
+{
+    // 静态缓冲区：避免函数栈溢出，且仅初始化一次
+    static uint8_t usb_buf[USB_PRINTF_BUF_SIZE];
+    va_list args;
+    int len = 0;
+    uint8_t send_status = 0;
+
+    //清空缓冲区（可选，防止脏数据）
+    memset(usb_buf, 0, USB_PRINTF_BUF_SIZE);
+
+    //初始化可变参数列表
+    va_start(args, format);
+
+    //将格式化内容写入缓冲区（vsnprintf自动处理格式化，返回实际需要的字节数）
+    // 第三个参数：缓冲区大小-1，预留'\0'结束符
+    len = vsnprintf((char *)usb_buf, USB_PRINTF_BUF_SIZE - 1, format, args);
+
+    //结束可变参数列表
+    va_end(args);
+
+    // 检查格式化结果是否溢出
+    if (len < 0 || len >= USB_PRINTF_BUF_SIZE)
+    {
+        // 缓冲区不足，返回溢出错误
+        return -1;
+    }
+
+    //调用CDC_Transmit_FS发送数据（len为实际有效字节数）
+    send_status = CDC_Transmit_FS(usb_buf, len);
+
+    //检查发送状态（CDC_Transmit_FS返回USBD_OK(0)表示成功）
+    if (send_status != USBD_OK)
+    {
+        // 发送失败
+        return -2;
+    }
+
+    //返回实际发送的字节数
+    return len;
+}
+
+
+
+
+
+/*启动任务的配置*/
+#define START_TASK_STACK 130
+#define START_TASK_PRIORITY 1
+TaskHandle_t start_TaskHandle;
+void start_Task(void * pvParameters);
+
+
+/*任务1的配置*/
+#define TASK1_STACK 130
+#define TASK1_PRIORITY 2
+TaskHandle_t task1_TaskHandle;
+void task1(void * pvParameters);
+
+/*任务2的配置*/
+#define TASK2_STACK 130
+#define TASK2_PRIORITY 3
+TaskHandle_t task2_TaskHandle;
+void task2(void * pvParameters);
+
+/*任务3的配置*/
+#define TASK3_STACK 512
+#define TASK3_PRIORITY 4
+TaskHandle_t task3_TaskHandle;
+void task3(void * pvParameters);
+
+
+
+
+
+
+
+
+/**
+ * @brief  FreeRTOS启动函数，创建启动任务并启动调度器
+
+ */
+
+void freertos_start(void)
+{
+	/*创建启动任务*/
+	xTaskCreate((TaskFunction_t) start_Task,//任务函数的地址
+		 (char *) "start_Task",//任务名字
+		 (configSTACK_DEPTH_TYPE) START_TASK_STACK,//任务堆栈大小
+		 (void *) NULL,//传递给任务函数的参数
+		 (UBaseType_t) START_TASK_PRIORITY,//任务优先级
+		 (TaskHandle_t *) &start_TaskHandle//任务句柄的地址
+
+		);
+
+	/*启动调度器*/
+	vTaskStartScheduler();
+
+}
+
+
+/**
+ * @brief  启动任务函数，创建其他任务并删除自身
+ * @param  pvParameters: 传递给任务函数的参数（此处未使用）
+ */
+
+void start_Task(void * pvParameters)
+{
+
+	taskENTER_CRITICAL(); // 进入临界区，防止任务切换干扰任务创建过程
+
+	/*创建启动任务*/
+	xTaskCreate((TaskFunction_t) task1,//任务函数的地址
+		 (char *) "task1",//任务名字
+		 (configSTACK_DEPTH_TYPE) TASK1_STACK,//任务堆栈大小
+		 (void *) NULL,//传递给任务函数的参数
+		 (UBaseType_t) TASK1_PRIORITY,//任务优先级
+		 (TaskHandle_t *) &task1_TaskHandle//任务句柄的地址
+
+		);
+
+	xTaskCreate((TaskFunction_t) task2,//任务函数的地址
+		 (char *) "task2",//任务名字
+		 (configSTACK_DEPTH_TYPE) TASK2_STACK,//任务堆栈大小
+		 (void *) NULL,//传递给任务函数的参数
+		 (UBaseType_t) TASK2_PRIORITY,//任务优先级
+		 (TaskHandle_t *) &task2_TaskHandle//任务句柄的地址
+
+		);
+
+	xTaskCreate((TaskFunction_t) task3,//任务函数的地址
+		 (char *) "task3",//任务名字
+		 (configSTACK_DEPTH_TYPE) TASK3_STACK,//任务堆栈大小
+		 (void *) NULL,//传递给任务函数的参数
+		 (UBaseType_t) TASK3_PRIORITY,//任务优先级
+		 (TaskHandle_t *) &task3_TaskHandle//任务句柄的地址
+
+		);
+
+	/*启动任务执行一次，删除启动任务*/
+	vTaskDelete(start_TaskHandle);
+
+	taskEXIT_CRITICAL(); // 退出临界区，允许任务切换
+
+
+}
+
+
+void task1(void * pvParameters)
+{
+	while (1)
+	{
+		usbprintf("任务1:按键扫描\r\n");
+		Key_Scanf();
+		vTaskDelay(500);
+	}
+}
+
+void task2(void * pvParameters)
+{
+	while (1)
+	{
+		usbprintf("任务2\r\n");
+		
+		vTaskDelay(500 );
+	}
+}
+
+
+
+char task_info[500];
+uint8_t suspend_flag = 0; // 任务挂起标志
+
+void task3(void * pvParameters)
+{
+	while (1)
+	{
+		usbprintf("任务3:按键挂起恢复任务\r\n");
+		
+				if(Key_Check(0,KEY_SINGLE))
+				{
+				
+					
+						//usbprintf("挂起任务2");
+						//vTaskSuspend(task2_TaskHandle);
+						//printf("挂起任务调度器\r\n");
+						usbprintf("挂起任务调度器\r\n");
+						vTaskSuspendAll(); // 挂起调度器，所有任务都将被挂起
+						 suspend_flag = 1; // 设置挂起标志
+					
+				}
+				else if(Key_Check(0,KEY_DOUBLE))
+				{
+					
+					
+						//usbprintf("恢复任务2");
+						//vTaskResume(task2_TaskHandle);
+						
+						usbprintf("恢复任务调度器\r\n");
+						xTaskResumeAll(); // 恢复调度器，所有任务将继续执行
+						suspend_flag = 0; // 清除挂起标志
+						
+					
+				}
+			
+	
+		/*打印任务状态*/
+		vTaskList(task_info);
+		usbprintf("%s\r\n",task_info);
+		if(suspend_flag == 0)
+		{
+			vTaskDelay(500);
+
+		}
+		
+	    
+
+	}
+		
+}
